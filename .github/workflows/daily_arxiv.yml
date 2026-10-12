@@ -2,8 +2,8 @@ name: Daily arXiv Paper Digest
 
 on:
   schedule:
-    # Run at 00:00 UTC daily (08:00 Beijing Time)
-    - cron: '0 0 * * *'
+    # Run at 01:00 UTC daily (09:00 Beijing Time)
+    - cron: '0 1 * * *'
   
   # Allow manual workflow trigger
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER || 'smtp.163.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '465' }}
         run: |
           python fetch_papers.py
