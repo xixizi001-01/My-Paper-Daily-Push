@@ -12,7 +12,13 @@ from difflib import SequenceMatcher
 # ========== Configuration ==========
 
 # arXiv search configuration
-CATEGORIES = ['cs.AI', 'cs.CV', 'cs.CL']  # Research areas of interest
+KEYWORDS = [
+    'flexible sensor', 'tactile sensor', 'electronic skin',
+    'ionic gel', 'ionogel', 'EDL capacitor', '3D force sensor',
+    'piezoelectric', 'triboelectric', 'wearable electronics',
+    'ionic capacitor', 'ionic capacitance', 'iontronic',
+    'electric double layer capacitor',
+]
 MAX_RESULTS = 5  # Number of papers to send daily
 MIN_PAPERS_PER_CATEGORY = 1  # Minimum papers per category to ensure balance
 
@@ -46,7 +52,7 @@ TEXT_TEMPLATES = {
         'days_ago': '天前',
         'published_today': '<strong>{count} 篇</strong>是今天发布',
         'published_yesterday': '<strong>{count} 篇</strong>是昨天发布',
-        # 'published_older_single': '<strong>{count} 篇</strong>是 {days} 天前发布（可能已读过）',
+        'published_older_single': '<strong>{count} 篇</strong>是 {days} 天前发布（可能已读过）',
         'published_older_multi': '<strong>{count} 篇</strong>是 2 天及更早前发布（可能已读过）',
         'notice_text': '本次推送的 {total} 篇论文中，{parts}。',
         'new_today': '今日新发布',
@@ -70,7 +76,7 @@ TEXT_TEMPLATES = {
         'days_ago': 'days ago',
         'published_today': '<strong>{count} papers</strong> published today',
         'published_yesterday': '<strong>{count} papers</strong> published yesterday',
-        # 'published_older_single': '<strong>{count} paper</strong> published {days} days ago (may have been read)',
+        'published_older_single': '<strong>{count} paper</strong> published {days} days ago (may have been read)',
         'published_older_multi': '<strong>{count} papers</strong> published 2+ days ago (may have been read)',
         'notice_text': 'Of the {total} papers in this digest, {parts}.',
         'new_today': 'NEW TODAY',
@@ -223,117 +229,38 @@ def remove_duplicate_papers(papers):
 
 
 def get_latest_papers():
-    """
-    Fetch latest papers from arXiv with quality filtering and deduplication
-    
-    Returns:
-        list: List of selected paper dictionaries
-    """
-    print(f"🔍 Searching for latest papers on arXiv...")
-    print(f"📚 Categories: {', '.join(CATEGORIES)}")
-    
-    client = arxiv.Client()
-    papers_by_category = defaultdict(list)
+    """Search titles and abstracts across arXiv using the requested keywords."""
+    query = ' OR '.join(
+        f'(ti:"{keyword}" OR abs:"{keyword}")' for keyword in KEYWORDS
+    )
+    print(f"Searching keywords: {', '.join(KEYWORDS)}")
+    search = arxiv.Search(
+        query=query,
+        max_results=100,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending,
+    )
+    papers = []
     seen_ids = set()
-    
-    # Step 1: Fetch papers from each category separately
-    for category in CATEGORIES:
-        print(f"\n🔎 Searching category: {category}")
-        
-        try:
-            search = arxiv.Search(
-                query=f'cat:{category}',
-                max_results=MAX_RESULTS * 2,  # Fetch more for better selection
-                sort_by=arxiv.SortCriterion.SubmittedDate,
-                sort_order=arxiv.SortOrder.Descending
-            )
-            
-            results = list(client.results(search))
-            print(f"  API returned {len(results)} papers")
-            
-            for result in results:
-                if result.entry_id not in seen_ids:
-                    seen_ids.add(result.entry_id)
-                    
-                    abstract_text = result.summary if hasattr(result, 'summary') else ''
-                    
-                    paper = {
-                        'title': result.title,
-                        'authors': ', '.join([author.name for author in result.authors]),
-                        'abstract': abstract_text,
-                        'pdf_url': result.pdf_url,
-                        'published': result.published,
-                        'categories': result.categories,
-                        'entry_id': result.entry_id,
-                        'primary_category': category
-                    }
-                    
-                    # Calculate quality score
-                    paper['quality_score'] = calculate_paper_quality_score(paper)
-                    
-                    papers_by_category[category].append(paper)
-                    
-                    print(f"  ✓ {result.title[:60]}... (score: {paper['quality_score']:.1f})")
-            
-            # Sort papers in this category by quality score
-            papers_by_category[category].sort(
-                key=lambda x: x['quality_score'], 
-                reverse=True
-            )
-            
-            print(f"  Found {len(papers_by_category[category])} papers in {category}")
-            
-        except Exception as e:
-            print(f"  ❌ Error searching {category}: {str(e)}")
+    for result in arxiv.Client().results(search):
+        if result.entry_id in seen_ids:
             continue
-    
-    # Step 2: Ensure category balance - select minimum papers from each category
-    print(f"\n⚖️ Ensuring category balance...")
-    selected_papers = []
-    
-    for category in CATEGORIES:
-        category_papers = papers_by_category[category]
-        if category_papers:
-            # Take top MIN_PAPERS_PER_CATEGORY papers from each category
-            num_to_take = min(MIN_PAPERS_PER_CATEGORY, len(category_papers))
-            selected_papers.extend(category_papers[:num_to_take])
-            print(f"  Selected {num_to_take} papers from {category}")
-    
-    # Step 3: Fill remaining slots with highest quality papers
-    remaining_slots = MAX_RESULTS - len(selected_papers)
-    
-    if remaining_slots > 0:
-        print(f"\n📊 Filling {remaining_slots} remaining slots with highest quality papers...")
-        
-        # Collect all remaining papers
-        all_remaining = []
-        for category, papers in papers_by_category.items():
-            # Skip papers already selected
-            for paper in papers:
-                if paper not in selected_papers:
-                    all_remaining.append(paper)
-        
-        # Sort by quality score and take top papers
-        all_remaining.sort(key=lambda x: x['quality_score'], reverse=True)
-        selected_papers.extend(all_remaining[:remaining_slots])
-    
-    # Step 4: Remove duplicates using intelligent similarity detection
-    print(f"\n🔍 Checking for duplicate/similar papers...")
-    selected_papers = remove_duplicate_papers(selected_papers)
-    
-    # Step 5: Final sort by publish date (newest first)
-    selected_papers.sort(key=lambda x: x['published'], reverse=True)
-    
-    print(f"\n✅ Total papers collected: {len(selected_papers)}")
-    print(f"📄 Papers to send: {len(selected_papers)}")
-    
-    # Print category distribution
-    category_dist = Counter([p['primary_category'] for p in selected_papers])
-    print(f"\n📊 Category distribution:")
-    for cat, count in category_dist.items():
-        print(f"   {cat}: {count} papers")
-    
-    return selected_papers
+        seen_ids.add(result.entry_id)
+        paper = {
+            'title': result.title,
+            'authors': ', '.join(author.name for author in result.authors),
+            'abstract': result.summary,
+            'pdf_url': result.pdf_url,
+            'published': result.published,
+            'categories': result.categories,
+            'entry_id': result.entry_id,
+            'primary_category': result.primary_category,
+        }
+        paper['quality_score'] = calculate_paper_quality_score(paper)
+        papers.append(paper)
+    papers = remove_duplicate_papers(papers)
+    papers.sort(key=lambda paper: paper['published'], reverse=True)
+    return papers[:MAX_RESULTS]
 
 
 def analyze_paper_dates(papers):
@@ -442,7 +369,9 @@ Please use concise professional language suitable for quick reading."""
             summary = ""
             done_reasoning = False
             for chunk in response:
-                reasoning_chunk = chunk.choices[0].delta.reasoning_content or ''
+                if not chunk.choices:
+                    continue
+                reasoning_chunk = getattr(chunk.choices[0].delta, 'reasoning_content', '') or ''
                 answer_chunk = chunk.choices[0].delta.content or ''
                 
                 if reasoning_chunk:
@@ -819,8 +748,10 @@ def send_email(subject, html_content):
         html_part = MIMEText(html_content, 'html', 'utf-8')
         message.attach(html_part)
         
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
+        smtp_class = smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP
+        with smtp_class(SMTP_SERVER, SMTP_PORT, timeout=60) as server:
+            if SMTP_PORT != 465:
+                server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.send_message(message)
         
@@ -845,7 +776,7 @@ def main():
     if missing_vars:
         print(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
         print("Please set these environment variables")
-        return
+        raise RuntimeError("Missing required email/API configuration")
     
     try:
         # Step 1: Fetch latest papers with quality filtering
@@ -885,7 +816,8 @@ def main():
         # Step 5: Send email
         today = datetime.now().strftime('%Y-%m-%d')
         subject = f"📚 arXiv Daily Paper Digest - {today}"
-        send_email(subject, html_content)
+        if not send_email(subject, html_content):
+            raise RuntimeError("Email delivery failed")
         
         print("\n" + "=" * 60)
         print("✅ Execution completed successfully!")
