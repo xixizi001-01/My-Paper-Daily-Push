@@ -1,834 +1,411 @@
+import html
+import json
 import os
-import smtplib
-import arxiv
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
-from openai import OpenAI
-from collections import Counter, defaultdict
 import re
-from difflib import SequenceMatcher
+import smtplib
+import time
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-# ========== Configuration ==========
+import requests
+from openai import OpenAI
 
-# arXiv search configuration
+
 KEYWORDS = [
-    'flexible sensor', 'tactile sensor', 'electronic skin',
-    'ionic gel', 'ionogel', 'EDL capacitor', '3D force sensor',
-    'piezoelectric', 'triboelectric', 'wearable electronics',
-    'ionic capacitor', 'ionic capacitance', 'iontronic',
-    'electric double layer capacitor',
+    "tactile sensor", "flexible sensor", "electronic skin", "ionogel",
+    "ionic gel", "ionic liquid", "electric double layer capacitor",
+    "EDL capacitor", "3D force sensing", "3D force sensor", "PVDF-TrFE",
+    "piezoelectric sensor", "piezoelectric", "triboelectric",
+    "wearable electronics", "ionic capacitor", "iontronic",
 ]
-MAX_RESULTS = 5  # Number of papers to send daily
-MIN_PAPERS_PER_CATEGORY = 1  # Minimum papers per category to ensure balance
 
-# Language configuration
-# Supported values: 'zh' (Chinese), 'en' (English), 'both' (Bilingual)
-EMAIL_LANGUAGE = os.environ.get('EMAIL_LANGUAGE', 'zh')  # Default to Chinese
+JOURNALS = [
+    "Advanced Materials", "Advanced Functional Materials", "ACS Nano",
+    "Nano Energy", "Nature Communications", "npj Flexible Electronics",
+    "Small", "Advanced Science", "Chemical Engineering Journal",
+]
 
-# DeepSeek API configuration
-DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
-DEEPSEEK_BASE_URL = 'https://api-inference.modelscope.cn/v1'
-DEEPSEEK_MODEL = 'deepseek-ai/DeepSeek-V3.2-Exp'
-
-# Email configuration
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
-SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
-RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
-SMTP_SERVER = os.environ.get('SMTP_SERVER', 'smtp.gmail.com')
-SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
-
-# Quality filtering thresholds
-MIN_ABSTRACT_LENGTH = 100  # Minimum abstract length (characters)
-SIMILARITY_THRESHOLD = 0.85  # Title similarity threshold for duplicate detection
-
-# Language text templates
-TEXT_TEMPLATES = {
-    'zh': {
-        'title': 'arXiv 每日论文推送',
-        'date_notice': '论文日期提醒',
-        'today': '今天',
-        'yesterday': '昨天',
-        'days_ago': '天前',
-        'published_today': '<strong>{count} 篇</strong>是今天发布',
-        'published_yesterday': '<strong>{count} 篇</strong>是昨天发布',
-        'published_older_single': '<strong>{count} 篇</strong>是 {days} 天前发布（可能已读过）',
-        'published_older_multi': '<strong>{count} 篇</strong>是 2 天及更早前发布（可能已读过）',
-        'notice_text': '本次推送的 {total} 篇论文中，{parts}。',
-        'new_today': '今日新发布',
-        'yesterday_label': '昨日发布',
-        'days_ago_label': '{days} 天前',
-        'high_quality': '⭐ 高质量',
-        'authors': '作者',
-        'published': '发布日期',
-        'categories': '分类',
-        'quality_score': '质量评分',
-        'ai_summary': 'AI 摘要',
-        'view_pdf': '查看 PDF',
-        'footer_auto': '本邮件由 arXiv Daily Summarizer 自动生成',
-        'footer_powered': '由 DeepSeek AI 提供摘要服务'
-    },
-    'en': {
-        'title': 'arXiv Daily Paper Digest',
-        'date_notice': 'Date Notice',
-        'today': 'today',
-        'yesterday': 'yesterday',
-        'days_ago': 'days ago',
-        'published_today': '<strong>{count} papers</strong> published today',
-        'published_yesterday': '<strong>{count} papers</strong> published yesterday',
-        'published_older_single': '<strong>{count} paper</strong> published {days} days ago (may have been read)',
-        'published_older_multi': '<strong>{count} papers</strong> published 2+ days ago (may have been read)',
-        'notice_text': 'Of the {total} papers in this digest, {parts}.',
-        'new_today': 'NEW TODAY',
-        'yesterday_label': 'YESTERDAY',
-        'days_ago_label': '{days} DAYS AGO',
-        'high_quality': '⭐ HIGH QUALITY',
-        'authors': 'Authors',
-        'published': 'Published',
-        'categories': 'Categories',
-        'quality_score': 'Quality Score',
-        'ai_summary': 'AI Summary',
-        'view_pdf': 'View PDF',
-        'footer_auto': 'Generated automatically by arXiv Daily Summarizer',
-        'footer_powered': 'Powered by DeepSeek AI'
-    }
+# RSS is best-effort. Crossref and Semantic Scholar cover every journal in the
+# whitelist; publisher feeds add newly posted articles before all indexes sync.
+RSS_FEEDS = {
+    "Nature RSS": [
+        ("Nature Communications", "https://www.nature.com/ncomms.rss"),
+        ("npj Flexible Electronics", "https://www.nature.com/npjflexelectron.rss"),
+    ],
+    "ACS RSS": [
+        ("ACS Nano", "https://pubs.acs.org/action/showFeed?type=etoc&feed=rss&jc=ancac3"),
+    ],
+    "Wiley RSS": [
+        ("Advanced Materials", "https://advanced.onlinelibrary.wiley.com/feed/15214095/most-recent"),
+        ("Advanced Functional Materials", "https://advanced.onlinelibrary.wiley.com/feed/16163028/most-recent"),
+        ("Small", "https://small-journal.com/feed/16136829/most-recent"),
+        ("Advanced Science", "https://advanced.onlinelibrary.wiley.com/feed/21983844/most-recent"),
+    ],
 }
 
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "10"))
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = "https://api-inference.modelscope.cn/v1"
+DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V3.2-Exp"
+SEMANTIC_SCHOLAR_API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
+RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.163.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 
-def calculate_paper_quality_score(paper):
-    """
-    Calculate a quality score for a paper based on various factors
-    
-    Args:
-        paper: Dictionary containing paper information
-        
-    Returns:
-        float: Quality score (higher is better)
-    """
-    score = 0.0
-    
-    # Factor 1: Abstract length (longer abstracts usually indicate more detailed work)
-    abstract_length = len(paper.get('abstract', ''))
-    if abstract_length > 500:
-        score += 2.0
-    elif abstract_length > 300:
-        score += 1.0
-    elif abstract_length < MIN_ABSTRACT_LENGTH:
-        score -= 2.0  # Penalize very short abstracts
-    
-    # Factor 2: Number of authors (more authors might indicate collaborative/important work)
-    num_authors = len(paper.get('authors', '').split(','))
-    if 3 <= num_authors <= 8:
-        score += 1.0
-    elif num_authors > 8:
-        score += 0.5
-    
-    # Factor 3: Title characteristics
-    title = paper.get('title', '').lower()
-    
-    # Bonus for important keywords
-    important_keywords = [
-        'novel', 'efficient', 'state-of-the-art', 'breakthrough', 'improved',
-        'transformer', 'attention', 'neural', 'deep learning', 'framework',
-        'benchmark', 'dataset', 'evaluation', 'survey', 'review'
-    ]
-    for keyword in important_keywords:
-        if keyword in title:
-            score += 0.5
-    
-    # Penalty for very short or very long titles
-    title_words = len(title.split())
-    if title_words < 5:
-        score -= 0.5
-    elif title_words > 25:
-        score -= 0.3
-    
-    # Factor 4: Recency bonus (newer papers get higher scores)
-    # Make datetime timezone-aware for comparison
-    now = datetime.now(paper['published'].tzinfo)
-    days_old = (now - paper['published']).days
-    if days_old == 0:
-        score += 3.0  # Strong bonus for today's papers
-    elif days_old == 1:
-        score += 1.5
-    elif days_old == 2:
-        score += 0.5
-    else:
-        score -= (days_old - 2) * 0.3  # Penalty for older papers
-    
-    return score
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "FlexibleSensorDaily/1.0 (mailto:luxi0131@163.com)",
+    "Accept": "application/json",
+})
 
 
-def calculate_title_similarity(title1, title2):
-    """
-    Calculate similarity between two paper titles
-    
-    Args:
-        title1: First title string
-        title2: Second title string
-        
-    Returns:
-        float: Similarity score between 0 and 1
-    """
-    # Normalize titles: lowercase and remove special characters
-    def normalize(text):
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', '', text)
-        return text
-    
-    norm_title1 = normalize(title1)
-    norm_title2 = normalize(title2)
-    
-    return SequenceMatcher(None, norm_title1, norm_title2).ratio()
+def clean_text(value):
+    value = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
 
 
-def remove_duplicate_papers(papers):
-    """
-    Remove duplicate or very similar papers based on title similarity
-    
-    Args:
-        papers: List of paper dictionaries
-        
-    Returns:
-        list: Filtered list without duplicates
-    """
-    if not papers:
-        return papers
-    
-    filtered_papers = []
-    
-    for paper in papers:
-        is_duplicate = False
-        
-        for existing_paper in filtered_papers:
-            similarity = calculate_title_similarity(
-                paper['title'], 
-                existing_paper['title']
-            )
-            
-            if similarity >= SIMILARITY_THRESHOLD:
-                print(f"  🔄 Detected similar paper (similarity: {similarity:.2f}):")
-                print(f"     Original: {existing_paper['title'][:60]}...")
-                print(f"     Duplicate: {paper['title'][:60]}...")
-                
-                # Keep the one with higher quality score
-                if paper.get('quality_score', 0) > existing_paper.get('quality_score', 0):
-                    filtered_papers.remove(existing_paper)
-                    filtered_papers.append(paper)
-                    print(f"     → Kept the higher quality version")
-                else:
-                    print(f"     → Skipped duplicate")
-                
-                is_duplicate = True
-                break
-        
-        if not is_duplicate:
-            filtered_papers.append(paper)
-    
-    return filtered_papers
+def normalize(value):
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
 
 
-def get_latest_papers():
-    """Search titles and abstracts across arXiv using the requested keywords."""
-    query = ' OR '.join(
-        f'(ti:"{keyword}" OR abs:"{keyword}")' for keyword in KEYWORDS
-    )
-    print(f"Searching keywords: {', '.join(KEYWORDS)}")
-    search = arxiv.Search(
-        query=query,
-        max_results=100,
-        sort_by=arxiv.SortCriterion.SubmittedDate,
-        sort_order=arxiv.SortOrder.Descending,
-    )
+JOURNAL_ALIASES = {normalize(name): name for name in JOURNALS}
+JOURNAL_ALIASES.update({
+    "adv mater": "Advanced Materials",
+    "adv funct mater": "Advanced Functional Materials",
+    "nat commun": "Nature Communications",
+    "npj flex electron": "npj Flexible Electronics",
+    "adv sci weinh": "Advanced Science",
+    "chem eng j": "Chemical Engineering Journal",
+})
+
+
+def canonical_journal(value):
+    key = normalize(value)
+    if key in JOURNAL_ALIASES:
+        return JOURNAL_ALIASES[key]
+    for alias, official in JOURNAL_ALIASES.items():
+        if alias and (alias in key or key in alias):
+            return official
+    return None
+
+
+def matched_keywords(title, abstract):
+    haystack = normalize(f"{title} {abstract}")
+    return [keyword for keyword in KEYWORDS if normalize(keyword) in haystack]
+
+
+def parse_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def crossref_date(item):
+    for field in ("published-online", "published-print", "published", "issued", "created"):
+        parts = item.get(field, {}).get("date-parts", [[]])[0]
+        if parts:
+            try:
+                return date(*((parts + [1, 1])[:3]))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def fetch_crossref():
+    print("Fetching Crossref...")
+    start = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
     papers = []
-    seen_ids = set()
-    for result in arxiv.Client().results(search):
-        if result.entry_id in seen_ids:
-            continue
-        seen_ids.add(result.entry_id)
-        paper = {
-            'title': result.title,
-            'authors': ', '.join(author.name for author in result.authors),
-            'abstract': result.summary,
-            'pdf_url': result.pdf_url,
-            'published': result.published,
-            'categories': result.categories,
-            'entry_id': result.entry_id,
-            'primary_category': result.primary_category,
+    for keyword in KEYWORDS:
+        params = {
+            "query.bibliographic": keyword,
+            "filter": f"from-pub-date:{start},type:journal-article",
+            "select": "DOI,title,container-title,abstract,URL,author,published,published-online,published-print,issued,created",
+            "rows": 20, "sort": "published", "order": "desc",
+            "mailto": "luxi0131@163.com",
         }
-        paper['quality_score'] = calculate_paper_quality_score(paper)
-        papers.append(paper)
-    papers = remove_duplicate_papers(papers)
-    papers.sort(key=lambda paper: paper['published'], reverse=True)
-    return papers[:MAX_RESULTS]
-
-
-def analyze_paper_dates(papers):
-    """
-    Analyze the publication date distribution of papers
-    
-    Args:
-        papers: List of paper dictionaries
-        
-    Returns:
-        dict: Statistics about paper dates
-    """
-    now = datetime.now()
-    today = now.date()
-    yesterday = (now - timedelta(days=1)).date()
-    
-    date_stats = {
-        'today': 0,
-        'yesterday': 0,
-        'older': 0,
-        'date_distribution': Counter()
-    }
-    
-    for paper in papers:
-        paper_date = paper['published'].date()
-        date_stats['date_distribution'][paper_date] += 1
-        
-        if paper_date == today:
-            date_stats['today'] += 1
-        elif paper_date == yesterday:
-            date_stats['yesterday'] += 1
-        else:
-            date_stats['older'] += 1
-    
-    return date_stats
-
-
-def summarize_paper(paper, language='zh'):
-    """
-    Generate paper summary using DeepSeek AI
-    
-    Args:
-        paper: Dictionary containing paper information
-        language: 'zh' for Chinese, 'en' for English, 'both' for bilingual
-        
-    Returns:
-        dict: AI-generated summaries {'zh': str, 'en': str} or single language str
-    """
-    print(f"\n🤖 Generating AI summary for:")
-    print(f"   {paper['title'][:70]}...")
-    
-    summaries = {}
-    
-    # Define prompts for each language
-    prompts = {
-        'zh': f"""请用中文总结以下学术论文，包括以下几个方面：
-1. 研究背景和动机（1-2句话）
-2. 主要方法和创新点（2-3句话）
-3. 实验结果和结论（1-2句话）
-4. 潜在应用价值（1句话）
-
-论文标题：{paper['title']}
-
-论文摘要：
-{paper['abstract']}
-
-请用简洁专业的语言总结，适合快速阅读理解。""",
-        'en': f"""Please summarize the following academic paper in English, including these aspects:
-1. Research background and motivation (1-2 sentences)
-2. Main methods and innovations (2-3 sentences)
-3. Experimental results and conclusions (1-2 sentences)
-4. Potential application value (1 sentence)
-
-Paper title: {paper['title']}
-
-Paper abstract:
-{paper['abstract']}
-
-Please use concise professional language suitable for quick reading."""
-    }
-    
-    # Determine which languages to generate
-    langs_to_generate = ['zh', 'en'] if language == 'both' else [language]
-    
-    try:
-        client = OpenAI(
-            base_url=DEEPSEEK_BASE_URL,
-            api_key=DEEPSEEK_API_KEY,
-        )
-        
-        for lang in langs_to_generate:
-            print(f"   Generating {'Chinese' if lang == 'zh' else 'English'} summary...")
-            
-            response = client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=[
-                    {
-                        'role': 'user',
-                        'content': prompts[lang]
-                    }
-                ],
-                stream=True
-            )
-            
-            # Collect streaming response
-            summary = ""
-            done_reasoning = False
-            for chunk in response:
-                if not chunk.choices:
+        try:
+            response = SESSION.get("https://api.crossref.org/works", params=params, timeout=30)
+            response.raise_for_status()
+            for item in response.json()["message"]["items"]:
+                journal = canonical_journal((item.get("container-title") or [""])[0])
+                title = clean_text((item.get("title") or [""])[0])
+                abstract = clean_text(item.get("abstract", ""))
+                matches = matched_keywords(title, abstract)
+                if not journal or not matches:
                     continue
-                reasoning_chunk = getattr(chunk.choices[0].delta, 'reasoning_content', '') or ''
-                answer_chunk = chunk.choices[0].delta.content or ''
-                
-                if reasoning_chunk:
-                    continue  # Skip reasoning process
-                elif answer_chunk:
-                    if not done_reasoning:
-                        done_reasoning = True
-                    summary += answer_chunk
-            
-            summaries[lang] = summary.strip()
-            print(f"   ✅ {'Chinese' if lang == 'zh' else 'English'} summary completed")
-        
-        # Return format based on language mode
-        if language == 'both':
-            return summaries
-        else:
-            return summaries[language]
-    
-    except Exception as e:
-        print(f"   ❌ AI summary generation failed: {str(e)}")
-        error_msg = {
-            'zh': "摘要生成失败，请直接查看原文。",
-            'en': "Summary generation failed. Please read the original paper."
+                papers.append({
+                    "title": title, "journal": journal,
+                    "doi": (item.get("DOI") or "").lower(),
+                    "url": item.get("URL") or "", "abstract": abstract,
+                    "published": crossref_date(item),
+                    "authors": ", ".join(
+                        " ".join(filter(None, [a.get("given"), a.get("family")]))
+                        for a in item.get("author", [])
+                    ),
+                    "keywords": matches, "sources": ["Crossref"],
+                    "citation_count": 0,
+                })
+        except Exception as exc:
+            print(f"Crossref warning for {keyword}: {exc}")
+        time.sleep(0.08)
+    return papers
+
+
+def fetch_semantic_scholar():
+    print("Fetching Semantic Scholar...")
+    papers = []
+    headers = {"x-api-key": SEMANTIC_SCHOLAR_API_KEY} if SEMANTIC_SCHOLAR_API_KEY else {}
+    fields = "title,abstract,venue,publicationDate,externalIds,url,authors,citationCount"
+    current_year = date.today().year
+    for keyword in KEYWORDS:
+        try:
+            response = SESSION.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={"query": keyword, "limit": 20, "fields": fields, "year": f"{current_year - 1}-"},
+                headers=headers, timeout=30,
+            )
+            if response.status_code == 429:
+                print("Semantic Scholar rate limit reached; continuing with other sources")
+                break
+            response.raise_for_status()
+            for item in response.json().get("data", []):
+                journal = canonical_journal(item.get("venue", ""))
+                title = clean_text(item.get("title", ""))
+                abstract = clean_text(item.get("abstract", ""))
+                matches = matched_keywords(title, abstract)
+                published = parse_date(item.get("publicationDate"))
+                if not journal or not matches:
+                    continue
+                if published and published < date.today() - timedelta(days=LOOKBACK_DAYS):
+                    continue
+                external = item.get("externalIds") or {}
+                papers.append({
+                    "title": title, "journal": journal,
+                    "doi": (external.get("DOI") or "").lower(),
+                    "url": item.get("url") or "", "abstract": abstract,
+                    "published": published,
+                    "authors": ", ".join(a.get("name", "") for a in item.get("authors", [])),
+                    "keywords": matches, "sources": ["Semantic Scholar"],
+                    "citation_count": item.get("citationCount") or 0,
+                })
+        except Exception as exc:
+            print(f"Semantic Scholar warning for {keyword}: {exc}")
+        time.sleep(1.1 if not SEMANTIC_SCHOLAR_API_KEY else 0.1)
+    return papers
+
+
+def xml_name(tag):
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def xml_value(node, *names):
+    wanted = {name.lower() for name in names}
+    for child in node.iter():
+        if xml_name(child.tag) in wanted:
+            if xml_name(child.tag) == "link" and child.get("href"):
+                return child.get("href")
+            if child.text:
+                return child.text
+    return ""
+
+
+def rss_entries(content):
+    root = ET.fromstring(content)
+    nodes = [node for node in root.iter() if xml_name(node.tag) in {"item", "entry"}]
+    for node in nodes:
+        yield {
+            "title": xml_value(node, "title"),
+            "summary": xml_value(node, "summary", "description", "content", "encoded"),
+            "link": xml_value(node, "link"),
+            "id": xml_value(node, "id", "guid", "identifier"),
+            "doi": xml_value(node, "doi"),
+            "author": xml_value(node, "author", "creator", "name"),
+            "date": xml_value(node, "published", "updated", "pubDate", "date"),
         }
-        if language == 'both':
-            return error_msg
-        else:
-            return error_msg.get(language, error_msg['en'])
 
 
-def generate_date_notice(date_stats, papers, language='zh'):
-    """
-    Generate date reminder HTML for email
-    
-    Args:
-        date_stats: Dictionary with date statistics
-        papers: List of papers
-        language: 'zh' or 'en'
-        
-    Returns:
-        str: HTML string for date notice
-    """
-    total = len(papers)
-    today_count = date_stats['today']
-    yesterday_count = date_stats['yesterday']
-    older_count = date_stats['older']
-    
-    # Don't show notice if all papers are today or yesterday
-    if older_count == 0 and today_count > 0:
-        return ""
-    
-    # Get text template
-    txt = TEXT_TEMPLATES.get(language, TEXT_TEMPLATES['en'])
-    
-    # Build notice message
-    notice_parts = []
-    
-    if today_count > 0:
-        notice_parts.append(txt['published_today'].format(count=today_count))
-    
-    if yesterday_count > 0:
-        notice_parts.append(txt['published_yesterday'].format(count=yesterday_count))
-    
-    if older_count > 0:
-        earliest_date = min(date_stats['date_distribution'].keys())
-        days_ago = (datetime.now().date() - earliest_date).days
-        
-        if older_count == 1:
-            notice_parts.append(txt['published_older_single'].format(count=older_count, days=days_ago))
-        else:
-            notice_parts.append(txt['published_older_multi'].format(count=older_count))
-    
-    notice_text = ", ".join(notice_parts) if language == 'en' else "、".join(notice_parts)
-    notice_message = txt['notice_text'].format(total=total, parts=notice_text)
-    
-    # Choose style based on older paper ratio
-    if older_count >= total * 0.5:
-        icon = "⚠️"
-        bg_color = "#fff3cd"
-        border_color = "#ffc107"
-        text_color = "#856404"
-    elif older_count > 0:
-        icon = "ℹ️"
-        bg_color = "#d1ecf1"
-        border_color = "#17a2b8"
-        text_color = "#0c5460"
-    else:
-        icon = "✨"
-        bg_color = "#d4edda"
-        border_color = "#28a745"
-        text_color = "#155724"
-    
-    html = f"""
-    <div style="background: {bg_color}; border-left: 4px solid {border_color}; padding: 15px 20px; margin-bottom: 25px; border-radius: 5px;">
-        <div style="color: {text_color}; font-size: 15px; line-height: 1.6;">
-            <span style="font-size: 20px; margin-right: 8px;">{icon}</span>
-            <strong>{txt['date_notice']}:</strong> {notice_message}
-        </div>
-    </div>
-    """
-    
-    return html
-
-
-def generate_email_content(papers_with_summaries, language='zh'):
-    """
-    Generate HTML email content
-    
-    Args:
-        papers_with_summaries: List of dictionaries containing papers and summaries
-        language: 'zh', 'en', or 'both' for bilingual
-        
-    Returns:
-        str: HTML formatted email content
-    """
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    papers = [item['paper'] for item in papers_with_summaries]
-    date_stats = analyze_paper_dates(papers)
-    
-    # Get text template (use 'en' for bilingual mode header)
-    txt = TEXT_TEMPLATES.get('zh' if language == 'zh' else 'en', TEXT_TEMPLATES['en'])
-    
-    html = f"""
-    <html>
-    <head>
-        <style>
-            body {{
-                font-family: 'Segoe UI', Arial, sans-serif;
-                line-height: 1.6;
-                color: #333;
-                max-width: 800px;
-                margin: 0 auto;
-                padding: 20px;
-                background-color: #f5f5f5;
-            }}
-            .header {{
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                padding: 30px;
-                border-radius: 10px;
-                text-align: center;
-                margin-bottom: 30px;
-            }}
-            .header h1 {{
-                margin: 0;
-                font-size: 28px;
-            }}
-            .date {{
-                font-size: 14px;
-                opacity: 0.9;
-                margin-top: 10px;
-            }}
-            .paper {{
-                background: white;
-                padding: 25px;
-                margin-bottom: 25px;
-                border-radius: 8px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                position: relative;
-            }}
-            .paper-title {{
-                color: #667eea;
-                font-size: 20px;
-                font-weight: bold;
-                margin-bottom: 10px;
-                line-height: 1.4;
-            }}
-            .quality-badge {{
-                display: inline-block;
-                padding: 2px 8px;
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-                margin-left: 8px;
-                background: #ffd700;
-                color: #856404;
-            }}
-            .meta {{
-                color: #666;
-                font-size: 14px;
-                margin-bottom: 15px;
-                padding-bottom: 15px;
-                border-bottom: 2px solid #f0f0f0;
-            }}
-            .meta-item {{
-                margin: 5px 0;
-            }}
-            .date-badge {{
-                display: inline-block;
-                padding: 2px 8px;
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-                margin-left: 8px;
-            }}
-            .date-today {{
-                background: #d4edda;
-                color: #155724;
-            }}
-            .date-yesterday {{
-                background: #d1ecf1;
-                color: #0c5460;
-            }}
-            .date-older {{
-                background: #f8d7da;
-                color: #721c24;
-            }}
-            .categories {{
-                display: inline-block;
-            }}
-            .category-tag {{
-                background: #e8eaf6;
-                color: #5c6bc0;
-                padding: 3px 10px;
-                border-radius: 12px;
-                font-size: 12px;
-                margin-right: 5px;
-                display: inline-block;
-            }}
-            .summary {{
-                background: #f8f9ff;
-                padding: 15px;
-                border-left: 4px solid #667eea;
-                margin: 15px 0;
-                border-radius: 4px;
-            }}
-            .summary-title {{
-                font-weight: bold;
-                color: #667eea;
-                margin-bottom: 10px;
-            }}
-            .links {{
-                margin-top: 15px;
-            }}
-            .link-button {{
-                display: inline-block;
-                background: #667eea;
-                color: white;
-                padding: 10px 20px;
-                text-decoration: none;
-                border-radius: 5px;
-                margin-right: 10px;
-                font-size: 14px;
-            }}
-            .link-button:hover {{
-                background: #5568d3;
-            }}
-            .footer {{
-                text-align: center;
-                color: #999;
-                font-size: 12px;
-                margin-top: 40px;
-                padding-top: 20px;
-                border-top: 1px solid #ddd;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>📚 {txt['title']}</h1>
-            <div class="date">{today}</div>
-        </div>
-        
-        {generate_date_notice(date_stats, papers, 'zh' if language == 'zh' else 'en')}
-    """
-    
-    now = datetime.now()
-    today_date = now.date()
-    yesterday_date = (now - timedelta(days=1)).date()
-    
-    for i, item in enumerate(papers_with_summaries, 1):
-        paper = item['paper']
-        summary = item['summary']
-        
-        # Add date badge
-        paper_date = paper['published'].date()
-        if paper_date == today_date:
-            date_badge = f'<span class="date-badge date-today">{txt["new_today"]}</span>'
-        elif paper_date == yesterday_date:
-            date_badge = f'<span class="date-badge date-yesterday">{txt["yesterday_label"]}</span>'
-        else:
-            days_ago = (today_date - paper_date).days
-            date_badge = f'<span class="date-badge date-older">{txt["days_ago_label"].format(days=days_ago)}</span>'
-        
-        # Add quality badge for high-quality papers
-        quality_badge = ''
-        if paper.get('quality_score', 0) >= 5.0:
-            quality_badge = f'<span class="quality-badge">{txt["high_quality"]}</span>'
-        
-        # Format category tags
-        categories_html = ''.join([
-            f'<span class="category-tag">{cat}</span>' 
-            for cat in paper['categories'][:3]
-        ])
-        
-        # Handle bilingual summaries
-        if language == 'both' and isinstance(summary, dict):
-            summary_html = f"""
-                <div style="margin-bottom: 15px;">
-                    <div style="font-weight: bold; color: #667eea; margin-bottom: 8px;">🇨🇳 中文摘要</div>
-                    <div>{summary.get('zh', '').replace(chr(10), '<br>')}</div>
-                </div>
-                <div>
-                    <div style="font-weight: bold; color: #667eea; margin-bottom: 8px;">🇬🇧 English Summary</div>
-                    <div>{summary.get('en', '').replace(chr(10), '<br>')}</div>
-                </div>
-            """
-        else:
-            summary_text = summary if isinstance(summary, str) else summary.get(language, '')
-            summary_html = summary_text.replace(chr(10), '<br>')
-        
-        html += f"""
-        <div class="paper">
-            <div class="paper-title">{i}. {paper['title']}{date_badge}{quality_badge}</div>
-            <div class="meta">
-                <div class="meta-item">
-                    <strong>👥 {txt['authors']}:</strong> {paper['authors'][:200]}{'...' if len(paper['authors']) > 200 else ''}
-                </div>
-                <div class="meta-item">
-                    <strong>📅 {txt['published']}:</strong> {paper['published'].strftime('%Y-%m-%d %H:%M')}
-                </div>
-                <div class="meta-item">
-                    <strong>🏷️ {txt['categories']}:</strong>
-                    <div class="categories">{categories_html}</div>
-                </div>
-                <div class="meta-item">
-                    <strong>📊 {txt['quality_score']}:</strong> {paper.get('quality_score', 0):.1f}
-                </div>
-            </div>
-            
-            <div class="summary">
-                <div class="summary-title">🤖 {txt['ai_summary']}</div>
-                <div>{summary_html}</div>
-            </div>
-            
-            <div class="links">
-                <a href="{paper['pdf_url']}" class="link-button">📄 {txt['view_pdf']}</a>
-            </div>
-        </div>
-        """
-    
-    html += f"""
-        <div class="footer">
-            <p>{txt['footer_auto']}</p>
-            <p>{txt['footer_powered']}</p>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return html
-
-
-def send_email(subject, html_content):
-    """
-    Send email via SMTP
-    
-    Args:
-        subject: Email subject line
-        html_content: HTML formatted email content
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    print(f"\n📧 Sending email to {RECEIVER_EMAIL}...")
-    
+def rss_date(value):
+    parsed = parse_date(value)
+    if parsed:
+        return parsed
     try:
-        message = MIMEMultipart('alternative')
-        message['Subject'] = subject
-        message['From'] = SENDER_EMAIL
-        message['To'] = RECEIVER_EMAIL
-        
-        html_part = MIMEText(html_content, 'html', 'utf-8')
-        message.attach(html_part)
-        
-        smtp_class = smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP
-        with smtp_class(SMTP_SERVER, SMTP_PORT, timeout=60) as server:
-            if SMTP_PORT != 465:
-                server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(message)
-        
-        print(f"✅ Email sent successfully!")
-        return True
-    
-    except Exception as e:
-        print(f"❌ Email sending failed: {str(e)}")
-        return False
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(value).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_doi(entry):
+    candidates = " ".join([entry.get("id", ""), entry.get("link", ""), entry.get("doi", "")])
+    match = re.search(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", candidates, re.I)
+    return match.group(0).rstrip(".,;)").lower() if match else ""
+
+
+def fetch_rss():
+    print("Fetching publisher RSS feeds...")
+    papers = []
+    for source, feeds in RSS_FEEDS.items():
+        for journal, url in feeds:
+            try:
+                response = SESSION.get(
+                    url, timeout=30,
+                    headers={"Accept": "application/rss+xml, application/xml, text/xml"},
+                )
+                response.raise_for_status()
+                for entry in rss_entries(response.content):
+                    title = clean_text(entry.get("title", ""))
+                    abstract = clean_text(entry.get("summary", "") or entry.get("description", ""))
+                    matches = matched_keywords(title, abstract)
+                    published = rss_date(entry.get("date"))
+                    if not matches:
+                        continue
+                    if published and published < date.today() - timedelta(days=LOOKBACK_DAYS):
+                        continue
+                    papers.append({
+                        "title": title, "journal": journal,
+                        "doi": extract_doi(entry), "url": entry.get("link", ""),
+                        "abstract": abstract, "published": published,
+                        "authors": clean_text(entry.get("author", "")),
+                        "keywords": matches, "sources": [source],
+                        "citation_count": 0,
+                    })
+            except Exception as exc:
+                print(f"{source} warning for {journal}: {exc}")
+    return papers
+
+
+def paper_key(paper):
+    return f"doi:{paper['doi']}" if paper.get("doi") else f"title:{normalize(paper['title'])}"
+
+
+def merge_papers(papers):
+    merged = {}
+    for paper in papers:
+        key = paper_key(paper)
+        if key not in merged:
+            merged[key] = paper
+            continue
+        current = merged[key]
+        current["sources"] = sorted(set(current["sources"] + paper["sources"]))
+        current["keywords"] = sorted(set(current["keywords"] + paper["keywords"]))
+        current["citation_count"] = max(current.get("citation_count", 0), paper.get("citation_count", 0))
+        for field in ("abstract", "authors", "url", "doi", "published"):
+            if not current.get(field) and paper.get(field):
+                current[field] = paper[field]
+    result = list(merged.values())
+    result.sort(key=lambda p: (
+        p.get("published") or date.min,
+        len(p.get("keywords", [])), p.get("citation_count", 0),
+    ), reverse=True)
+    return result[:MAX_RESULTS]
+
+
+def fallback_analysis(paper):
+    keyword_text = "、".join(paper["keywords"][:3]) or "柔性传感"
+    return {
+        "innovation": f"文章围绕{keyword_text}展开；需查看原文确认具体创新。",
+        "relevance": min(5, max(1, 2 + len(paper["keywords"]))),
+        "inspiration": f"可重点参考其{keyword_text}相关材料体系、器件结构与测试方法。",
+    }
+
+
+def analyze_paper(paper):
+    fallback = fallback_analysis(paper)
+    if not DEEPSEEK_API_KEY:
+        return fallback
+    prompt = f"""你是柔性多维力传感器研究助手。只根据给定题目和摘要，输出严格 JSON：
+{{"innovation":"一句中文，说明核心创新","relevance":1到5的整数,"inspiration":"一句中文，说明对离子凝胶、离子电容或三维力传感课题可借鉴之处"}}
+期刊：{paper['journal']}
+题目：{paper['title']}
+命中关键词：{', '.join(paper['keywords'])}
+摘要：{paper['abstract'] or '未提供摘要，请依据题目保守判断'}"""
+    try:
+        client = OpenAI(base_url=DEEPSEEK_BASE_URL, api_key=DEEPSEEK_API_KEY)
+        response = client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, temperature=0.2,
+        )
+        data = json.loads(response.choices[0].message.content)
+        return {
+            "innovation": clean_text(str(data.get("innovation", fallback["innovation"]))),
+            "relevance": min(5, max(1, int(data.get("relevance", fallback["relevance"])))),
+            "inspiration": clean_text(str(data.get("inspiration", fallback["inspiration"]))),
+        }
+    except Exception as exc:
+        print(f"AI analysis warning for {paper['title']}: {exc}")
+        return fallback
+
+
+def generate_email(papers):
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    cards = []
+    for paper in papers:
+        analysis = paper["analysis"]
+        stars = "★" * analysis["relevance"] + "☆" * (5 - analysis["relevance"])
+        target = paper.get("url") or (f"https://doi.org/{paper['doi']}" if paper.get("doi") else "#")
+        link = html.escape(target)
+        published = paper["published"].isoformat() if paper.get("published") else "日期待确认"
+        cards.append(f"""
+        <article style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin:18px 0;">
+          <div style="font-size:18px;font-weight:700;color:#7c3aed;">⭐ {html.escape(paper['journal'])}</div>
+          <div style="margin-top:12px;color:#6b7280;font-size:13px;">{published} · {html.escape(' / '.join(paper['sources']))}</div>
+          <h2 style="font-size:20px;line-height:1.45;margin:8px 0 16px;"><a href="{link}" style="color:#111827;text-decoration:none;">{html.escape(paper['title'])}</a></h2>
+          <div style="margin:10px 0;"><b>创新：</b>{html.escape(analysis['innovation'])}</div>
+          <div style="margin:10px 0;"><b>与你课题相关：</b><span style="color:#f59e0b;font-size:20px;letter-spacing:2px;">{stars}</span></div>
+          <div style="margin:10px 0;"><b>可借鉴：</b>{html.escape(analysis['inspiration'])}</div>
+          <div style="margin-top:14px;color:#6b7280;font-size:13px;">关键词：{html.escape('、'.join(paper['keywords']))}</div>
+        </article>""")
+    if not cards:
+        cards.append("<div style='background:#fff;padding:24px;border-radius:12px;'>过去 7 天内，目标期刊中没有发现命中关键词的新论文。</div>")
+    return f"""
+    <html><body style="margin:0;background:#f3f4f6;color:#1f2937;font-family:Arial,'Microsoft YaHei',sans-serif;">
+      <main style="max-width:760px;margin:auto;padding:24px;">
+        <header style="background:linear-gradient(135deg,#6d28d9,#2563eb);color:white;padding:28px;border-radius:14px;">
+          <h1 style="margin:0;font-size:27px;">{today} 柔性传感日报</h1>
+          <p style="margin:10px 0 0;opacity:.9;">目标期刊 · 关键词过滤 · 多数据源去重</p>
+        </header>
+        {''.join(cards)}
+        <footer style="text-align:center;color:#9ca3af;font-size:12px;padding:18px;">Crossref · Semantic Scholar · Nature RSS · ACS RSS · Wiley RSS</footer>
+      </main>
+    </body></html>"""
+
+
+def send_email(subject, content):
+    message = MIMEMultipart("alternative")
+    message["Subject"] = subject
+    message["From"] = SENDER_EMAIL
+    message["To"] = RECEIVER_EMAIL
+    message.attach(MIMEText(content, "html", "utf-8"))
+    smtp_class = smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP
+    with smtp_class(SMTP_SERVER, SMTP_PORT, timeout=60) as server:
+        if SMTP_PORT != 465:
+            server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(message)
 
 
 def main():
-    """Main execution function"""
-    print("=" * 60)
-    print("🚀 arXiv Daily Paper Digest - Starting")
-    print("=" * 60)
-    
-    # Check required environment variables
-    required_vars = ['DEEPSEEK_API_KEY', 'SENDER_EMAIL', 'SENDER_PASSWORD', 'RECEIVER_EMAIL']
-    missing_vars = [var for var in required_vars if not os.environ.get(var)]
-    
-    if missing_vars:
-        print(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
-        print("Please set these environment variables")
-        raise RuntimeError("Missing required email/API configuration")
-    
-    try:
-        # Step 1: Fetch latest papers with quality filtering
-        papers = get_latest_papers()
-        
-        if not papers:
-            print("\n⚠️ No papers found, exiting")
-            return
-        
-        # Step 2: Analyze paper dates and output statistics
-        date_stats = analyze_paper_dates(papers)
-        print(f"\n📊 Paper Date Statistics:")
-        print(f"   Today: {date_stats['today']} papers")
-        print(f"   Yesterday: {date_stats['yesterday']} papers")
-        print(f"   Older: {date_stats['older']} papers")
-        
-        # Step 3: Generate AI summaries for each paper
-        print("\n" + "=" * 60)
-        print("🤖 Generating AI Summaries")
-        print("=" * 60)
-        
-        papers_with_summaries = []
-        for i, paper in enumerate(papers, 1):
-            print(f"\n[{i}/{len(papers)}]")
-            summary = summarize_paper(paper, EMAIL_LANGUAGE)
-            papers_with_summaries.append({
-                'paper': paper,
-                'summary': summary
-            })
-        
-        # Step 4: Generate email content
-        print("\n" + "=" * 60)
-        print("📧 Generating Email Content")
-        print("=" * 60)
-        html_content = generate_email_content(papers_with_summaries, EMAIL_LANGUAGE)
-        
-        # Step 5: Send email
-        today = datetime.now().strftime('%Y-%m-%d')
-        subject = f"📚 arXiv Daily Paper Digest - {today}"
-        if not send_email(subject, html_content):
-            raise RuntimeError("Email delivery failed")
-        
-        print("\n" + "=" * 60)
-        print("✅ Execution completed successfully!")
-        print("=" * 60)
-    
-    except Exception as e:
-        print(f"\n❌ Execution error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
+    missing = [name for name in ("SENDER_EMAIL", "SENDER_PASSWORD", "RECEIVER_EMAIL") if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
+    papers = merge_papers(fetch_crossref() + fetch_semantic_scholar() + fetch_rss())
+    print(f"Selected {len(papers)} journal papers after whitelist, keyword filtering, and deduplication")
+    for paper in papers:
+        print(f"- {paper['journal']}: {paper['title']}")
+        paper["analysis"] = analyze_paper(paper)
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    send_email(f"{today} 柔性传感日报", generate_email(papers))
+    print("Email sent successfully")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
