@@ -1,9 +1,9 @@
-name: Daily arXiv Paper Digest
+name: Daily Flexible Sensor Journal Digest
 
 on:
   schedule:
     # Run at 01:00 UTC daily (09:00 Beijing Time)
-    - cron: '0 1 * * *'
+    - cron: '7 1 * * *'
   
   # Allow manual workflow trigger
   workflow_dispatch:
