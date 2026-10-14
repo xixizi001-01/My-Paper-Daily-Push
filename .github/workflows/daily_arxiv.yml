@@ -2,8 +2,8 @@ name: Daily Flexible Sensor Journal Digest
 
 on:
   schedule:
-    # Run at 01:00 UTC daily (09:00 Beijing Time)
-    - cron: '7 1 * * *'
+    # Run at 01:23 UTC daily (09:23 Beijing Time), away from peak scheduling minutes
+    - cron: '23 1 * * *'
   
   # Allow manual workflow trigger
   workflow_dispatch:
