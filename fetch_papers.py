@@ -18,12 +18,14 @@ KEYWORDS = [
     "ionic gel", "ionic liquid", "electric double layer capacitor",
     "EDL capacitor", "3D force sensing", "3D force sensor", "PVDF-TrFE",
     "piezoelectric sensor", "piezoelectric", "triboelectric",
-    "wearable electronics", "ionic capacitor", "iontronic",
-]
+    "wearable electronics", "ionic capacitor", "iontronic",]
 
 JOURNALS = [
     "Advanced Materials", "Advanced Functional Materials", "ACS Nano",
-    "Nano Energy", "Nature Communications", "npj Flexible Electronics",
+    "Nano Energy", "Nature", "Nature Materials", "Nature Electronics",
+    "Nature Nanotechnology", "Nature Communications",
+    "Communications Materials", "Communications Engineering",
+    "npj Flexible Electronics",
     "Small", "Advanced Science", "Chemical Engineering Journal",
 ]
 
@@ -31,7 +33,13 @@ JOURNALS = [
 # whitelist; publisher feeds add newly posted articles before all indexes sync.
 RSS_FEEDS = {
     "Nature RSS": [
+        ("Nature", "https://www.nature.com/nature.rss"),
+        ("Nature Materials", "https://www.nature.com/nmat.rss"),
+        ("Nature Electronics", "https://www.nature.com/natelectron.rss"),
+        ("Nature Nanotechnology", "https://www.nature.com/nnano.rss"),
         ("Nature Communications", "https://www.nature.com/ncomms.rss"),
+        ("Communications Materials", "https://www.nature.com/commsmat.rss"),
+        ("Communications Engineering", "https://www.nature.com/commseng.rss"),
         ("npj Flexible Electronics", "https://www.nature.com/npjflexelectron.rss"),
     ],
     "ACS RSS": [
