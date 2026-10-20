@@ -301,6 +301,13 @@ def paper_key(paper):
     return f"doi:{paper['doi']}" if paper.get("doi") else f"title:{normalize(paper['title'])}"
 
 
+def paper_keys(paper):
+    keys = {f"title:{normalize(paper['title'])}"}
+    if paper.get("doi"):
+        keys.add(f"doi:{paper['doi']}")
+    return keys
+
+
 def load_seen_papers():
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as history_file:
@@ -431,7 +438,7 @@ def main():
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
     seen_papers = load_seen_papers()
     candidates = merge_papers(fetch_crossref() + fetch_semantic_scholar() + fetch_rss())
-    unseen_papers = [paper for paper in candidates if paper_key(paper) not in seen_papers]
+    unseen_papers = [paper for paper in candidates if paper_keys(paper).isdisjoint(seen_papers)]
     papers = unseen_papers[:MAX_RESULTS]
     print(f"Skipped {len(candidates) - len(unseen_papers)} previously sent papers")
     print(f"Selected {len(papers)} journal papers after whitelist, keyword filtering, and deduplication")
@@ -440,7 +447,8 @@ def main():
         paper["analysis"] = analyze_paper(paper)
     today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     send_email(f"{today} 柔性传感日报", generate_email(papers))
-    seen_papers.update(paper_key(paper) for paper in papers)
+    for paper in papers:
+        seen_papers.update(paper_keys(paper))
     save_seen_papers(seen_papers)
     print("Email sent successfully")
 
