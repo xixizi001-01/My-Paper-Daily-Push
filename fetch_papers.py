@@ -18,7 +18,8 @@ KEYWORDS = [
     "ionic gel", "ionic liquid", "electric double layer capacitor",
     "EDL capacitor", "3D force sensing", "3D force sensor", "PVDF-TrFE",
     "piezoelectric sensor", "piezoelectric", "triboelectric",
-    "wearable electronics", "ionic capacitor", "iontronic",]
+    "wearable electronics", "ionic capacitor", "iontronic",
+]
 
 JOURNALS = [
     "Advanced Materials", "Advanced Functional Materials", "ACS Nano",
@@ -64,6 +65,7 @@ SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.163.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+HISTORY_FILE = os.environ.get("HISTORY_FILE", ".paper_history/seen_papers.json")
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -85,7 +87,12 @@ JOURNAL_ALIASES = {normalize(name): name for name in JOURNALS}
 JOURNAL_ALIASES.update({
     "adv mater": "Advanced Materials",
     "adv funct mater": "Advanced Functional Materials",
+    "nat mater": "Nature Materials",
+    "nat electron": "Nature Electronics",
+    "nat nanotechnol": "Nature Nanotechnology",
     "nat commun": "Nature Communications",
+    "commun mater": "Communications Materials",
+    "commun eng": "Communications Engineering",
     "npj flex electron": "npj Flexible Electronics",
     "adv sci weinh": "Advanced Science",
     "chem eng j": "Chemical Engineering Journal",
@@ -294,6 +301,23 @@ def paper_key(paper):
     return f"doi:{paper['doi']}" if paper.get("doi") else f"title:{normalize(paper['title'])}"
 
 
+def load_seen_papers():
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as history_file:
+            data = json.load(history_file)
+        return set(data if isinstance(data, list) else [])
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+
+
+def save_seen_papers(seen):
+    directory = os.path.dirname(HISTORY_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as history_file:
+        json.dump(sorted(seen), history_file, ensure_ascii=False, indent=2)
+
+
 def merge_papers(papers):
     merged = {}
     for paper in papers:
@@ -313,7 +337,7 @@ def merge_papers(papers):
         p.get("published") or date.min,
         len(p.get("keywords", [])), p.get("citation_count", 0),
     ), reverse=True)
-    return result[:MAX_RESULTS]
+    return result
 
 
 def fallback_analysis(paper):
@@ -405,13 +429,19 @@ def main():
     missing = [name for name in ("SENDER_EMAIL", "SENDER_PASSWORD", "RECEIVER_EMAIL") if not os.environ.get(name)]
     if missing:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
-    papers = merge_papers(fetch_crossref() + fetch_semantic_scholar() + fetch_rss())
+    seen_papers = load_seen_papers()
+    candidates = merge_papers(fetch_crossref() + fetch_semantic_scholar() + fetch_rss())
+    unseen_papers = [paper for paper in candidates if paper_key(paper) not in seen_papers]
+    papers = unseen_papers[:MAX_RESULTS]
+    print(f"Skipped {len(candidates) - len(unseen_papers)} previously sent papers")
     print(f"Selected {len(papers)} journal papers after whitelist, keyword filtering, and deduplication")
     for paper in papers:
         print(f"- {paper['journal']}: {paper['title']}")
         paper["analysis"] = analyze_paper(paper)
     today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     send_email(f"{today} 柔性传感日报", generate_email(papers))
+    seen_papers.update(paper_key(paper) for paper in papers)
+    save_seen_papers(seen_papers)
     print("Email sent successfully")
 
 
