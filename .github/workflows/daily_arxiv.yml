@@ -2,7 +2,7 @@ name: Daily Flexible Sensor Journal Digest
 
 on:
   schedule:
-    # Run at 01:23 UTC daily (09:23 Beijing Time), away from peak scheduling minutes
+    # Run at 01:23 UTC daily (09:23 Beijing Time), away from peak scheduling minutes.
     - cron: '23 1 * * *'
   
   # Allow manual workflow trigger
@@ -16,6 +16,14 @@ jobs:
       # 1. Checkout code
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
+
+      - name: ♻️ Restore sent-paper history
+        uses: actions/cache/restore@v4
+        with:
+          path: .paper_history
+          key: paper-history-${{ github.run_id }}
+          restore-keys: |
+            paper-history-
       
       # 2. Setup Python environment
       - name: 🐍 Setup Python 3.11
@@ -41,3 +49,10 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT || '465' }}
         run: |
           python fetch_papers.py
+
+      - name: 💾 Save sent-paper history
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: .paper_history
+          key: paper-history-${{ github.run_id }}
